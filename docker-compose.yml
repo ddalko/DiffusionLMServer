@@ -1,0 +1,20 @@
+version: "3.9"
+services:
+  llada-fastapi:
+    build: .   
+    container_name: llada-fastapi
+    network_mode: host
+    volumes:
+      - ./diffusionlmserver:/app
+      - /data/huggingface:/models
+    restart: always  
+    environment: 
+      - MODEL_PATH=/models/LLaDA-8B-Instruct
+    command: uvicorn main:app --host 0.0.0.0 --port 8000
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
