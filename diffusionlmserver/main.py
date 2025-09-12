@@ -1,18 +1,21 @@
 # server.py
-import os, time, json, torch
+import os, time, torch
+import asyncio
 from typing import List, Optional, Dict, Any
-from fastapi import FastAPI, Response
+from fastapi import FastAPI, Request, HTTPException
 from pydantic import BaseModel
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse
 from transformers import AutoTokenizer, AutoModel
-
-from generate import generate
 
 # ---------------------
 # Model bootstrap
 # ---------------------
 MODEL_PATH = os.getenv("MODEL_PATH", "/models/LLaDA-8B-Instruct")
 DTYPE = torch.bfloat16 if os.getenv("TORCH_DTYPE", "bf16") == "bf16" else torch.float16
+GEN_LENGTH = int(os.getenv("GEN_LENGTH", "128"))
+STEPS = int(os.getenv("STEPS", "128"))
+BLOCK_LENGTH = int(os.getenv("BLOCK_LENGTH", "32"))
+
 DEVICE = os.getenv("DEVICE", "cuda")
 
 print(f"Loading {MODEL_PATH} ...")
@@ -55,41 +58,13 @@ class ChatCompletionReq(BaseModel):
 # Helper: chat template → input_ids
 # ---------------------
 def build_input_ids(messages: List[Dict[str, str]]) -> torch.Tensor:
-    # LLaDA는 chat template을 제공하므로, 그대로 사용
     templ = tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
-    ids = tokenizer(templ, return_tensors="pt")["input_ids"].to(DEVICE)
-    return ids
+    return tokenizer(templ, return_tensors="pt")["input_ids"]
 
 def decode_new_tokens(output_ids: torch.Tensor, prompt_len: int) -> str:
-    gen_ids = output_ids[0, prompt_len:]
-    text = tokenizer.decode(gen_ids, skip_special_tokens=True)
-    return text.strip()
-
-# ---------------------
-# Tool-calling 래핑(옵션)
-# ---------------------
-def text_to_tool_calls(text: str) -> Optional[List[Dict[str, Any]]]:
-    """
-    모델이 JSON을 냈다고 가정하고 파싱하여 OpenAI tool_calls 포맷으로 변환.
-    JSON이 아니면 None을 리턴해 일반 content로 내려보냅니다.
-    """
-    t = text.strip().strip("`")
-    if t.lower().startswith("json"):
-        t = t[4:].strip()
-    try:
-        obj = json.loads(t)
-        action = obj.get("action", "none")
-        args = obj.get("args", {})
-        return [{
-            "id": f"call_{int(time.time()*1000)}",
-            "type": "function",
-            "function": {
-                "name": action,
-                "arguments": json.dumps(args, ensure_ascii=False)
-            }
-        }]
-    except Exception:
-        return None
+    cpu_ids = output_ids.to("cpu", non_blocking=True).contiguous()
+    gen_ids = cpu_ids[0, prompt_len:].tolist()
+    return tokenizer.decode(gen_ids, skip_special_tokens=True).strip()
 
 # ---------------------
 # FastAPI app
@@ -98,67 +73,138 @@ app = FastAPI()
 
 @app.get("/v1/models")
 def list_models():
-    return {"object": "list", "data": [{"id": "llada-8b-instruct-transformers", "object": "model"}]}
+    return {"object": "list", "data": [{"id": "llada-8b-instruct", "object": "model"}, {"id": "llada-8b-base", "object": "model"}]}
 
 @app.post("/v1/chat/completions")
-def chat(req: ChatCompletionReq):
-    gen_length = 256
-    steps = 256
+async def chat(req: ChatCompletionReq, request: Request):
+    gen_length = GEN_LENGTH
+    steps = STEPS
+    block_length = BLOCK_LENGTH
+    mask_id = 126336 
 
-    # 1) messages → input_ids
     msgs = [m.dict() for m in req.messages]
+    input_ids_cpu = build_input_ids(msgs)
 
-    if req.tools:
-        msgs = [{"role":"system","content":
-                 "You must answer with ONE valid JSON object. No extra text."}] + msgs
+    stop_event = asyncio.Event()
+    async def watch_disconnect():
+        while not stop_event.is_set():
+            if await request.is_disconnected():
+                stop_event.set()
+                break
+            await asyncio.sleep(0.1)
+    watcher = asyncio.create_task(watch_disconnect())
 
-    input_ids = build_input_ids(msgs)
-    prompt_len = input_ids.shape[1]
+    gen_ids = None
+    input_ids = None
+    try:
+        input_ids = input_ids_cpu.to(DEVICE, non_blocking=True)
+        prompt_len = input_ids.shape[1]
 
-    # 2) generate
-    with torch.no_grad():
-        gen_ids = generate(model, input_ids, steps=steps, gen_length=gen_length, block_length=32, temperature=0., cfg_scale=0., remasking='low_confidence')
+        if gen_length % block_length != 0:
+            raise HTTPException(status_code=400, detail="gen_length must be multiple of block_length")
+        num_blocks = gen_length // block_length
 
-    text = decode_new_tokens(gen_ids, prompt_len)
+        if steps % num_blocks != 0:
+            raise HTTPException(status_code=400, detail="steps must be multiple of gen_length // block_length")
+        steps_per_block = steps // num_blocks
+    
+        def build_transfer_schedule(block_mask_index: torch.Tensor, steps_per_block: int) -> torch.Tensor:
+            m = block_mask_index.sum(dim=1)
+            sched = []
+            prev = torch.zeros_like(m)
+            for i in range(steps_per_block):
+                cur = torch.ceil(m.float() * (i + 1) / steps_per_block).to(torch.long)
+                sched.append((cur - prev).clamp_min(0))
+                prev = cur
+            return torch.stack(sched, dim=1)
+        
+        @torch.inference_mode()
+        def step_once(x: torch.Tensor):
+            logits = model(x).logits
+            x0 = logits.argmax(dim=-1)
+            logZ = logits.logsumexp(dim=-1)
+            chosen = logits.gather(-1, x0.unsqueeze(-1)).squeeze(-1)
+            x0_p = (chosen - logZ).exp()
+            del logits, logZ, chosen
+            return x0, x0_p
+        
+        x = torch.full((1, prompt_len + gen_length), mask_id, dtype=torch.long, device=DEVICE)
+        x[:, :prompt_len] = input_ids
 
-    # 3) 스트리밍 모드 (단순 content 스트리밍만 지원; tool_calls는 완성본만 권장)
-    if req.stream and not req.tools:
-        def event_stream():
-            # OpenAI SSE 형식 흉내
-            chunk_id = int(time.time()*1000)
-            for ch in text:
-                delta = {"id": f"chatcmpl_{chunk_id}",
-                         "object": "chat.completion.chunk",
-                         "choices": [{"index":0, "delta":{"content": ch}, "finish_reason": None}]}
-                yield f"data: {json.dumps(delta, ensure_ascii=False)}\n\n"
-            done = {"id": f"chatcmpl_{chunk_id}",
-                    "object": "chat.completion.chunk",
-                    "choices": [{"index":0, "delta":{}, "finish_reason": "stop"}]}
-            yield f"data: {json.dumps(done, ensure_ascii=False)}\n\n"
-            yield "data: [DONE]\n\n"
-        return StreamingResponse(event_stream(), media_type="text/event-stream")
+        try:
+            with torch.inference_mode():
+                for nb in range(num_blocks):
+                    start = prompt_len + nb * block_length
+                    end   = start + block_length
 
-    # 4) tool_calls 또는 일반 content로 래핑
-    message: Dict[str, Any] = {"role": "assistant"}
-    if req.tools:
-        tool_calls = text_to_tool_calls(text)
-        if tool_calls:
-            message["tool_calls"] = tool_calls
-        else:
-            # JSON 파싱 실패 시, 안전하게 일반 content로 반환
-            message["content"] = text
-    else:
-        message["content"] = text
+                    block_mask_index = (x[:, start:end] == mask_id)
+                    num_transfer_tokens = build_transfer_schedule(block_mask_index, steps_per_block)
 
-    resp = {
-        "id": f"chatcmpl_{int(time.time()*1000)}",
-        "object": "chat.completion",
-        "created": int(time.time()),
-        "model": req.model,
-        "choices": [{
-            "index": 0,
-            "message": message,
-            "finish_reason": "tool_calls" if "tool_calls" in message else "stop"
-        }]
-    }
-    return JSONResponse(resp)
+                    for i in range(steps_per_block):
+                        if stop_event.is_set():
+                            raise HTTPException(status_code=499, detail="Client Closed Request")
+
+                        mask_index = (x == mask_id)
+                        x0, x0_p = step_once(x)
+
+                        x0_p[:, end:] = float('-inf')
+
+                        neg_inf = torch.full_like(x0_p, float('-inf'))
+                        confidence = torch.where(mask_index, x0_p, neg_inf)
+
+                        transfer_index = torch.zeros_like(x0, dtype=torch.bool, device=x.device)
+                        k = int(num_transfer_tokens[0, i].item())
+                        if k > 0:
+                            _, idx = torch.topk(confidence[0], k=k, largest=True, sorted=False)
+                            transfer_index[0, idx] = True
+
+                        x = torch.where(transfer_index, x0, x)
+                        del x0, x0_p, confidence, mask_index, transfer_index
+                gen_ids = x
+        except torch.cuda.OutOfMemoryError:
+            if DEVICE.startswith("cuda"):
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+            raise HTTPException(status_code=507, detail="GPU OOM during generation. Try shorter prompt or gen_length.")
+
+        if stop_event.is_set():
+            raise HTTPException(status_code=499, detail="Client Closed Request")
+
+        text = decode_new_tokens(gen_ids, prompt_len)
+
+        message: Dict[str, Any] = {"role": "assistant", "content": text}
+        resp = {
+            "id": f"chatcmpl_{int(time.time()*1000)}",
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": req.model,
+            "choices": [{
+                "index": 0,
+                "message": message,
+                "finish_reason": "tool_calls" if "tool_calls" in message else "stop"
+            }]
+        }
+        with open(f"json_results/{resp['id']}.json", "w") as f:
+            import json
+            tmp_resp = resp.copy()
+            tmp_resp["request_messages"] = req.dict().get("messages", [])
+            json.dump(tmp_resp, f, indent=2)
+        return JSONResponse(resp)
+
+    except asyncio.CancelledError:
+        stop_event.set()
+        raise
+
+    finally:
+        stop_event.set()
+        watcher.cancel()
+        if gen_ids is not None:
+            del gen_ids
+        if input_ids_cpu is not None:
+            del input_ids_cpu
+        if 'input_ids' in locals():
+            del input_ids
+        
+        if DEVICE.startswith("cuda"):
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()

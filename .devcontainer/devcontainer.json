@@ -1,0 +1,30 @@
+{
+  "name": "llada-server",
+  "image": "diffusionlmserver-llada-fastapi:latest",
+  "runArgs": [
+    "--gpus=all",
+    "--network=host",
+    "-v",
+    "./diffusionlmserver:/app",
+    "-v",
+    "/data/huggingface:/models"
+  ],
+  "containerEnv": {
+    "PYTHONUNBUFFERED": "1"
+  },
+  "workspaceFolder": "/app",
+  "remoteUser": "root",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-python.python",
+        "ms-toolsai.jupyter",
+        "ms-azuretools.vscode-docker",
+        "ms-vscode.cpptools"
+      ],
+      "settings": {
+        "python.defaultInterpreterPath": "/opt/conda/bin/python"
+      }
+    }
+  }
+}

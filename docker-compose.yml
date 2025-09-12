@@ -1,7 +1,13 @@
-version: "3.9"
+x-common-env: &common-env
+  MODEL_PATH: /models/LLaDA-8B-Instruct
+  # MODEL_PATH: /models/LLaDA-8B-se
+  # MODEL_PATH: /models/LLaDA-8B-Instruct-sft
+  # MODEL_PATH: /data/huggingface/DiffuCoder-7B-cpGRPO
+  GEN_LENGTH: 128
+  STEPS: 128
 services:
   llada-fastapi:
-    build: .   
+    image: diffusionlmserver-llada-fastapi:latest
     container_name: llada-fastapi
     network_mode: host
     volumes:
@@ -9,8 +15,8 @@ services:
       - /data/huggingface:/models
     restart: always  
     environment: 
-      - MODEL_PATH=/models/LLaDA-8B-Instruct
-    command: uvicorn main:app --host 0.0.0.0 --port 8000
+      <<: *common-env
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --workers 1 --backlog 1024 --timeout-keep-alive 5
     deploy:
       resources:
         reservations:
